@@ -1,0 +1,143 @@
+name: LLVM integration
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      zkcl_ref:
+        description: Commit SHA of the compatible zkcl-dev/zkcl checkout
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    name: ${{ matrix.host }}
+    # Private sibling access is only available to this repository's workflows.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (vars.ZKCL_REF != '' &&
+       (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository))
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      ZKCL_REF: ${{ inputs.zkcl_ref || vars.ZKCL_REF }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            host: Darwin-arm64
+          - runner: ubuntu-24.04
+            host: Linux-x86_64
+
+    steps:
+      - name: Check runner and sibling checkout inputs
+        env:
+          EXPECTED_HOST: ${{ matrix.host }}
+          ZKCL_READ_TOKEN: ${{ secrets.ZKCL_READ_TOKEN }}
+        shell: bash
+        run: |
+          test "$(uname -s)-$(uname -m)" = "$EXPECTED_HOST"
+          if [[ ! "$ZKCL_REF" =~ ^[[:xdigit:]]{40}$ ]]; then
+            echo 'Set zkcl_ref or the ZKCL_REF repository variable to a full commit SHA.' >&2
+            exit 1
+          fi
+          if [[ -z "$ZKCL_READ_TOKEN" ]]; then
+            echo 'Set the ZKCL_READ_TOKEN Actions secret with read access to zkcl-dev/zkcl.' >&2
+            exit 1
+          fi
+
+      - uses: actions/checkout@v5
+        with:
+          path: llvm.zkcl
+          persist-credentials: false
+
+      - uses: actions/checkout@v5
+        with:
+          repository: zkcl-dev/zkcl
+          ref: ${{ env.ZKCL_REF }}
+          token: ${{ secrets.ZKCL_READ_TOKEN }}
+          path: zkcl
+          persist-credentials: false
+
+      - name: Check native crate and build zkcl CLI
+        shell: bash
+        run: |
+          test -f llvm.zkcl/native/Cargo.toml
+          (cd zkcl && cargo build --locked --release --target host-tuple -p zkcl-cli --bin zkcl)
+
+      - name: Install Nix for the signed Darwin binary cache
+        if: runner.os == 'macOS'
+        uses: cachix/install-nix-action@v31
+
+      - name: Install LLVM system libraries on Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libffi-dev libncurses-dev libxml2-dev libzstd-dev zlib1g-dev
+
+      - name: Restore the pinned Linux release archive
+        if: runner.os == 'Linux'
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}/llvm-cache/zkcl/llvm/LLVM-21.1.8-Linux-X64.tar.xz
+          key: llvm-${{ matrix.host }}-${{ hashFiles('llvm.zkcl/install-llvm') }}
+
+      - name: Install pinned LLVM and reuse its local cache
+        working-directory: llvm.zkcl
+        env:
+          XDG_CACHE_HOME: ${{ runner.temp }}/llvm-cache
+          XDG_DATA_HOME: ${{ runner.temp }}/llvm-data
+        shell: bash
+        run: |
+          unset LLVM_SYS_211_PREFIX
+          prefix=$(./install-llvm)
+          test "$("$prefix/bin/llvm-config" --version)" = 21.1.8
+          # A second Linux install must succeed without an archive download.
+          curl() { echo 'Unexpected LLVM download from a warm cache.' >&2; return 1; }
+          export -f curl
+          test "$(./install-llvm)" = "$prefix"
+          lib_dir=$("$prefix/bin/llvm-config" --libdir)
+          {
+            printf 'LLVM_SYS_211_PREFIX=%s\n' "$prefix"
+            printf 'LLVM_SYS_211_STRICT_VERSIONING=1\n'
+            printf 'CARGO_ENCODED_RUSTFLAGS=-Clink-arg=-Wl,-rpath,%s\n' "$lib_dir"
+          } >> "$GITHUB_ENV"
+
+      - name: Test the Rust LLVM crate
+        working-directory: llvm.zkcl/native
+        shell: bash
+        run: cargo test --release --target host-tuple
+
+      - name: Test the ASDF system through zkcl
+        working-directory: llvm.zkcl
+        shell: bash
+        run: ./install-llvm --run test zk-llvm
+
+      - name: Run the example binaries
+        working-directory: llvm.zkcl
+        shell: bash
+        run: |
+          set -euo pipefail
+          out=$(mktemp -d "$RUNNER_TEMP/llvm-examples.XXXXXX")
+          trap 'rm -rf "$out"' EXIT
+          for example in first-jit explicit-ir rewrite-ir dispatch-table jit-reload exception-ir tiny; do
+            ./install-llvm --run run --bin "$example"
+          done
+          ./install-llvm --run run --bin ir-pipeline -- examples/ir-tools/positive-part.ll "$out/positive-part.bc"
+          ./install-llvm --run run --bin ir-pipeline -- "$out/positive-part.bc" "$out/positive-part.s"
+          test -s "$out/positive-part.s"
+          ./install-llvm --run run --bin native-object -- "$out/order.o"
+          cc examples/native-object/driver.c "$out/order.o" -o "$out/order"
+          test "$("$out/order")" = 'Order total = 845 cents'
+
+      - name: Compile, link, and run the native compiler workload
+        working-directory: llvm.zkcl
+        shell: bash
+        run: ./install-llvm --run run tests/compiler-native.lisp

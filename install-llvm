@@ -1,0 +1,281 @@
+#!/usr/bin/env bash
+set -euf
+set -o pipefail
+
+usage() {
+    cat <<'EOF'
+Usage: install-llvm [--prefix PATH] [--build | --run ZKCL-ARG ...]
+
+Print an LLVM 21.1 development prefix for LLVM_SYS_211_PREFIX.
+The default downloads an official LLVM 21.1.8 archive on Linux. On
+Apple Silicon macOS it uses the signed Nix binary cache.
+
+--prefix PATH  Use an existing LLVM 21.1 installation. The environment
+               variable LLVM_SYS_211_PREFIX also selects an existing prefix.
+--build        Build the native libzkcl_llvm_api library from ./native.
+--run          Build ./native, export ZK_LLVM_LIBRARY, and invoke zkcl. The
+               default ASDF source registry includes this checkout.
+EOF
+}
+
+die() {
+    printf 'install-llvm: %s\n' "$*" >&2
+    exit 1
+}
+
+# Nix installs store objects atomically and keeps the LLVM closure alive
+# through the development output, which references the tools and libraries.
+realise() {
+    local store_path=$1 root=$state_dir/$2
+    local options=(--option substituters https://cache.nixos.org/ --option require-sigs true
+                   --option max-jobs 0 --option builders '')
+    if [ -L "$root" ] && [ "$(readlink "$root")" = "$store_path" ]; then
+        if nix-store --check-validity "$store_path" 2>/dev/null; then
+            return
+        fi
+        nix-store --realise "$store_path" \
+            "${options[@]}" \
+            || die "could not fetch $store_path from the Nix binary cache"
+        return
+    fi
+    nix-store --realise "$store_path" --add-root "$root" \
+        "${options[@]}" \
+        || die "could not fetch $store_path from the Nix binary cache"
+}
+
+check_nar_hash() {
+    local store_path=$1 expected=$2 actual
+    actual=$(nix-store --query --hash "$store_path") \
+        || die "could not read the digest for $store_path"
+    [ "$actual" = "sha256:$expected" ] \
+        || die "SHA-256 mismatch for $store_path (expected $expected, got $actual)"
+}
+
+sha256_file() {
+    if command -v sha256sum >/dev/null; then
+        sha256sum "$1" | awk '{print $1}'
+    elif command -v shasum >/dev/null; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    else
+        die 'sha256sum or shasum is required to verify the LLVM archive'
+    fi
+}
+
+check_file_hash() {
+    local file=$1 expected=$2 actual
+    actual=$(sha256_file "$file")
+    [ "$actual" = "$expected" ] \
+        || die "SHA-256 mismatch for $file (expected $expected, got $actual)"
+}
+
+download_archive() (
+    local archive_path=$1 url=$2 hash=$3 archive_tmp
+    command -v curl >/dev/null || die 'curl is required to download the LLVM archive'
+    archive_tmp=$(mktemp "$archive_path.tmp.XXXXXX")
+    trap 'rm -f -- "$archive_tmp"' EXIT
+    curl --fail --location --retry 3 --output "$archive_tmp" "$url" \
+        || die "could not download $url"
+    check_file_hash "$archive_tmp" "$hash"
+    mv -Tf -- "$archive_tmp" "$archive_path"
+)
+
+extract_archive() (
+    local archive_path=$1 extract_tmp staged_prefix
+    if [ -e "$prefix" ] || [ -L "$prefix" ]; then
+        [ -x "$prefix/bin/llvm-config" ] && exit 0
+        die "incomplete LLVM cache at $prefix; remove it and retry"
+    fi
+    extract_tmp=$(mktemp -d "$prefix.tmp.XXXXXX")
+    trap 'rm -rf -- "$extract_tmp"' EXIT
+    tar -xJf "$archive_path" -C "$extract_tmp" || die "could not extract $archive_path"
+    staged_prefix=$extract_tmp/${prefix##*/}
+    [ -x "$staged_prefix/bin/llvm-config" ] || die 'LLVM archive has an unexpected layout'
+
+    # GNU mv -T installs the directory as a single rename. If another process
+    # got there first, its completed prefix is already ready to use.
+    mv -T -- "$staged_prefix" "$prefix" 2>/dev/null || [ -x "$prefix/bin/llvm-config" ] \
+        || die "could not install LLVM in $prefix"
+)
+
+find_config() {
+    local name config version
+    # Match the search order in llvm-sys 211.
+    for name in llvm-config-21 llvm-config21 llvm21-config llvm-config-21.1 llvm-config211 llvm-config; do
+        config=$prefix/bin/$name
+        [ -x "$config" ] || continue
+        version=$("$config" --version) || die "cannot run $config"
+        case $version in
+            21.1.*) printf '%s\n' "$config"; return ;;
+        esac
+    done
+    die "expected a runnable LLVM 21.1 llvm-config in $prefix/bin"
+}
+
+prefix=${LLVM_SYS_211_PREFIX:-}
+mode=prefix
+while [ "$#" -gt 0 ]; do
+    case $1 in
+        --prefix)
+            [ "$#" -ge 2 ] && [ -n "$2" ] || die '--prefix needs an LLVM installation path'
+            prefix=$2
+            shift 2
+            ;;
+        --build) mode=build; shift ;;
+        --run)
+            [ "$mode" = prefix ] || die 'choose --build or --run'
+            shift
+            [ "$#" -gt 0 ] || die '--run needs a zkcl command'
+            mode=run
+            break
+            ;;
+        -h|--help) usage; exit 0 ;;
+        *) die "unknown argument $1 (see --help)" ;;
+    esac
+done
+
+if [ "$mode" != prefix ]; then
+    checkout=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+    native_dir=$checkout/native
+    [ -f "$native_dir/Cargo.toml" ] \
+        || die 'expected native/Cargo.toml inside llvm.zkcl'
+    command -v cargo >/dev/null || die 'Rust and Cargo are required to build native/'
+fi
+
+host=$(uname -s)-$(uname -m)
+expected_version=
+if [ -z "$prefix" ]; then
+    expected_version=21.1.8
+    # Paths and NAR SHA-256 values come from the corresponding signed
+    # https://cache.nixos.org/<store-path-hash>.narinfo records.
+    case $host in
+        Darwin-arm64)
+            # LLVM's official release preset does not build libLLVM.dylib.
+            # The pinned Nix outputs provide a relocatable shared library,
+            # headers, llvm-config, and the complete runtime closure.
+            llvm_dev=/nix/store/j7iv18sisaivlv9zkih8ypfrjlfycz9c-llvm-21.1.8-dev
+            llvm_dev_hash=1yhqkq1i0hqr1fj8i0x8k6b11n81ns4cgq1fj1n64wqnjw9xl78r
+            llvm_lib=/nix/store/ys1bwdrwwa2l8awdaq42h9a5w9jbg8n6-llvm-21.1.8-lib
+            llvm_lib_hash=0qpy8mssrnwv4csrfw72a4c9mick2vjplb9vw1zw94xh1jivgi67
+            if ! command -v nix-store >/dev/null; then
+                export PATH="$PATH:/nix/var/nix/profiles/default/bin:$HOME/.nix-profile/bin"
+            fi
+            command -v nix-store >/dev/null \
+                || die 'install Nix from https://nixos.org/download/ or supply --prefix PATH'
+            state_dir=${XDG_DATA_HOME:-$HOME/.local/share}/zkcl/llvm
+            mkdir -p -- "$state_dir" || die "cannot create $state_dir"
+            state_dir=$(CDPATH= cd -- "$state_dir" && pwd -P)
+            realise "$llvm_dev" "$expected_version-$host" >/dev/null
+            check_nar_hash "$llvm_dev" "$llvm_dev_hash"
+            check_nar_hash "$llvm_lib" "$llvm_lib_hash"
+            prefix=$llvm_dev
+            ;;
+        Linux-x86_64)
+            archive_base=LLVM-$expected_version-Linux-X64
+            archive=$archive_base.tar.xz
+            archive_url=https://github.com/llvm/llvm-project/releases/download/llvmorg-$expected_version/$archive
+            archive_hash=b3b7f2801d15d50736acea3c73982994d025b01c2f035b91ae3b49d1b575732b
+            cache_dir=${XDG_CACHE_HOME:-$HOME/.cache}/zkcl/llvm
+            mkdir -p -- "$cache_dir" || die "cannot create $cache_dir"
+            cache_dir=$(CDPATH= cd -- "$cache_dir" && pwd -P)
+            archive_path=$cache_dir/$archive
+            if [ -f "$archive_path" ]; then
+                check_file_hash "$archive_path" "$archive_hash"
+            else
+                download_archive "$archive_path" "$archive_url" "$archive_hash"
+            fi
+            prefix=$cache_dir/$archive_base
+            if [ ! -x "$prefix/bin/llvm-config" ]; then
+                extract_archive "$archive_path"
+            fi
+            ;;
+        *) die "no prebuilt LLVM for $host (supply --prefix PATH)" ;;
+    esac
+
+else
+    prefix=$(CDPATH= cd -- "$prefix" && pwd -P) || die 'LLVM prefix does not exist'
+fi
+
+llvm_config=$(find_config)
+if [ -n "$expected_version" ]; then
+    [ "$("$llvm_config" --version)" = "$expected_version" ] \
+        || die "expected the pinned LLVM $expected_version in $prefix"
+fi
+target=$("$llvm_config" --host-target) || die "cannot discover LLVM host target in $prefix"
+case $host:$target in
+    Darwin-arm64:arm64-apple-*|Darwin-arm64:aarch64-apple-*|Darwin-x86_64:x86_64-apple-*) ;;
+    Linux-x86_64:x86_64-linux-*|Linux-x86_64:x86_64-*-linux-*) ;;
+    Linux-aarch64:aarch64-linux-*|Linux-aarch64:aarch64-*-linux-*) ;;
+    Darwin-arm64:*|Darwin-x86_64:*|Linux-x86_64:*|Linux-aarch64:*)
+        die "LLVM host target $target does not match $host"
+        ;;
+esac
+include_dir=$("$llvm_config" --includedir) || die "cannot discover LLVM headers in $prefix"
+[ -f "$include_dir/llvm-c/Core.h" ] || die "no LLVM development headers in $include_dir"
+lib_dir=$("$llvm_config" --libdir) || die "cannot discover LLVM libraries in $prefix"
+link_mode=
+if lib_names=$("$llvm_config" --link-shared --libnames 2>/dev/null) && [ -n "$lib_names" ]; then
+    link_mode=--link-shared
+    for lib_name in $lib_names; do
+        [ -f "$lib_dir/$lib_name" ] || link_mode=
+    done
+fi
+if [ -z "$link_mode" ]; then
+    link_mode=--link-static
+    lib_names=$("$llvm_config" "$link_mode" --libnames) || die "no linkable LLVM libraries in $lib_dir"
+    [ -n "$lib_names" ] || die "no linkable LLVM libraries in $lib_dir"
+fi
+for lib_name in $lib_names; do
+    [ -f "$lib_dir/$lib_name" ] || die "missing LLVM library $lib_dir/$lib_name"
+done
+system_libs=$("$llvm_config" "$link_mode" --system-libs) || die 'cannot discover LLVM system libraries'
+for system_lib in $system_libs; do
+    case $system_lib in
+        /*) [ -f "$system_lib" ] || die "missing LLVM system library $system_lib" ;;
+    esac
+done
+
+if [ "$mode" = prefix ]; then
+    printf '%s\n' "$prefix"
+    exit 0
+fi
+
+export LLVM_SYS_211_PREFIX="$prefix"
+export LLVM_SYS_211_STRICT_VERSIONING=1
+if [ "$mode" = build ]; then
+    cd -- "$native_dir"
+    exec cargo rustc --release --lib -- -C "link-arg=-Wl,-rpath,$lib_dir"
+fi
+
+target_dir=${CARGO_TARGET_DIR:-$native_dir/target}
+case $target_dir in /*) ;; *) target_dir=$checkout/$target_dir ;; esac
+(
+    cd -- "$native_dir"
+    cargo rustc --release --target host-tuple --target-dir "$target_dir" \
+        --lib -- -C "link-arg=-Wl,-rpath,$lib_dir"
+)
+rustc_host=$(cd -- "$native_dir" && rustc -vV | sed -n 's/^host: //p')
+[ -n "$rustc_host" ] || die 'cannot discover the Rust host target'
+case $(uname -s) in
+    Darwin) lib_name=libzkcl_llvm_api.dylib ;;
+    *) lib_name=libzkcl_llvm_api.so ;;
+esac
+export ZK_LLVM_LIBRARY="$target_dir/$rustc_host/release/$lib_name"
+[ -f "$ZK_LLVM_LIBRARY" ] || die "expected built library at $ZK_LLVM_LIBRARY"
+
+if ! command -v zkcl >/dev/null; then
+    sibling=$checkout/../zkcl
+    for candidate in \
+        "$sibling/target/$rustc_host/release" \
+        "$sibling/target/release" \
+        "$sibling/target/$rustc_host/debug" \
+        "$sibling/target/debug"
+    do
+        if [ -x "$candidate/zkcl" ]; then
+            export PATH="$candidate:$PATH"
+            break
+        fi
+    done
+fi
+command -v zkcl >/dev/null || die 'zkcl executable not found in PATH or ../zkcl/target'
+export CL_SOURCE_REGISTRY="${CL_SOURCE_REGISTRY-$checkout/:}"
+exec zkcl "$@"
